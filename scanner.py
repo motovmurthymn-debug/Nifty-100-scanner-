@@ -3,6 +3,9 @@ import sys
 import time
 import logging
 import smtplib
+import csv
+import io
+import html
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -10,6 +13,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import yfinance as yf
+from docx import Document
+from docx.shared import Inches, Pt
 
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY200_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
@@ -649,73 +654,322 @@ def analyse_symbol(symbol, daily, hourly):
 
     return candidates, "ok"
 
+
+REPORT_SETUPS = ("Weekly + 1H", "Monthly + 4H")
+REPORT_BIASES = ("Bullish", "Bearish")
+
+
+def _fmt_price(value):
+    """Format a numeric value for human-readable report output."""
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _fmt_time(value):
+    """Shorten ISO timestamps for readable reports without changing source values."""
+    if not value:
+        return "N/A"
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        return parsed.strftime("%d %b %Y, %H:%M IST")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _status(value):
+    return "Yes" if bool(value) else "No"
+
+
+def _report_row(r):
+    """Flatten an existing signal record for CSV/XLSX/DOCX exports.
+    This function only formats already-computed results; it does not alter signal logic.
+    """
+    return {
+        "Stock": r.get("symbol", ""),
+        "Setup": r.get("setup", ""),
+        "Direction": r.get("bias", ""),
+        "HTF Structure": r.get("htf_event", ""),
+        "HTF Break Level": r.get("htf_break_level", ""),
+        "HTF Break Time": r.get("htf_event_time", ""),
+        "LTF Structure": r.get("ltf_event", ""),
+        "LTF Break Level": r.get("ltf_break_level", ""),
+        "LTF Break Time": r.get("ltf_event_time", ""),
+        "Current Price": r.get("price", ""),
+        "HTF OB Low": r.get("ob_low", ""),
+        "HTF OB High": r.get("ob_high", ""),
+        "OB Time": r.get("ob_time", ""),
+        "OB Candle Count": r.get("ob_candle_count", ""),
+        "HTF FVG Low": r.get("fvg_low", ""),
+        "HTF FVG High": r.get("fvg_high", ""),
+        "FVG Time": r.get("fvg_time", ""),
+        "Displacement (ATR)": r.get("displacement_atr", ""),
+        "Retest Type": r.get("retest_type", ""),
+        "Retest Time": r.get("retest_time", ""),
+        "FVG Mitigated": r.get("fvg_mitigated", ""),
+        "OB Mitigated": r.get("ob_mitigated", ""),
+        "OB Fully Covered": r.get("ob_fully_covered", ""),
+        "FVG POI Low": r.get("fvg_poi_low", ""),
+        "FVG POI High": r.get("fvg_poi_high", ""),
+        "FVG POI Active": r.get("fvg_poi_active", ""),
+        "OB POI Low": r.get("ob_poi_low", ""),
+        "OB POI High": r.get("ob_poi_high", ""),
+        "OB POI Active": r.get("ob_poi_active", ""),
+    }
+
+
 def format_message(results, scanned, failed):
-    now = datetime.now(IST).strftime("%d-%b-%Y %H:%M IST")
-    lines = [f"NIFTY 200 MULTI-TIMEFRAME SMC SCAN | {now}", ""]
-    for setup in ("Weekly + 1H", "Monthly + 4H"):
-        lines.append(setup)
-        for bias in ("Bullish", "Bearish"):
-            matches = [r for r in results if r["setup"] == setup and r["bias"] == bias]
-            matches.sort(key=lambda r: r["symbol"])
-            lines.append(f"{bias}:")
-            if not matches:
-                lines.append("  None")
-            for r in matches:
-                lines.append(
-                    f"  {r['symbol']} | HTF {r['htf_event']} @ {r['htf_break_level']} "
-                    f"| LTF {r['ltf_event']} @ {r['ltf_break_level']} "
-                    f"| Price {r['price']:.2f}"
-                )
-                lines.append(
-                    f"    HTF OB [{r['ob_low']:.2f}, {r['ob_high']:.2f}] "
-                    f"({r.get('ob_time', 'time unavailable')}; "
-                    f"{r.get('ob_candle_count', 1)} candle(s))"
-                )
-                lines.append(
-                    f"    HTF FVG [{r['fvg_low']:.2f}, {r['fvg_high']:.2f}] "
-                    f"({r.get('fvg_time', 'time unavailable')}); "
-                    f"displacement {r['displacement_atr']:.2f} ATR"
-                )
-                lines.append(
-                    f"    Retest: {r['retest_type']} at {r['retest_time']}; "
-                    f"FVG mitigated={r['fvg_mitigated']}; "
-                    f"OB mitigated={r['ob_mitigated']}; "
-                    f"OB fully covered={r['ob_fully_covered']}"
-                )
-                if r.get("fvg_poi_high") is not None and r.get("fvg_poi_low") is not None:
-                    lines.append(
-                        f"    FVG-mitigation candle range/POI: "
-                        f"[{r['fvg_poi_low']:.2f}, {r['fvg_poi_high']:.2f}] "
-                        f"(active until OB reached: {r['fvg_poi_active']})"
-                    )
-                if r.get("ob_poi_high") is not None and r.get("ob_poi_low") is not None:
-                    lines.append(
-                        f"    OB-mitigation candle range/POI: "
-                        f"[{r['ob_poi_low']:.2f}, {r['ob_poi_high']:.2f}] "
-                        f"(active until OB fully covered: {r['ob_poi_active']})"
-                    )
-        lines.append("")
-    lines.append(f"Data coverage: {scanned - failed}/{scanned} stocks")
+    """Create a structured plain-text email body from existing signal records only."""
+    now = datetime.now(IST).strftime("%d %b %Y · %H:%M IST")
+    successful = max(0, scanned - failed)
+    lines = [
+        "NIFTY 200 | DAILY MULTI-TIMEFRAME SMC SCAN",
+        f"Scan time: {now}",
+        f"Data coverage: {successful}/{scanned} stocks analysed",
+    ]
     if failed:
-        lines.append("WARNING: incomplete data; results may be provisional.")
-    lines.append("Structure breaks require completed candle closes; wick-only breaks are ignored.")
-    lines.append("SMC zones are algorithmic approximations; verify charts before trading.")
-    return "\\n".join(lines)
+        lines.append(f"DATA WARNING: {failed} stock(s) could not be analysed; results may be incomplete.")
+    lines.extend(["", "=" * 64])
+
+    for setup in REPORT_SETUPS:
+        lines.extend(["", setup.upper(), "-" * 64])
+        for bias in REPORT_BIASES:
+            matches = sorted(
+                (r for r in results if r.get("setup") == setup and r.get("bias") == bias),
+                key=lambda r: r.get("symbol", ""),
+            )
+            lines.extend(["", f"{bias.upper()} SETUPS ({len(matches)})", "-" * 32])
+            if not matches:
+                lines.append("No qualifying stocks.")
+                continue
+
+            for number, r in enumerate(matches, 1):
+                lines.extend([
+                    "",
+                    f"{number}. {r.get('symbol', 'UNKNOWN')}  |  Current price: ₹{_fmt_price(r.get('price'))}",
+                    f"   HIGHER TIMEFRAME ({'Weekly' if setup == 'Weekly + 1H' else 'Monthly'})",
+                    f"   Structure: {r.get('htf_event', 'N/A')} | Break level: ₹{_fmt_price(r.get('htf_break_level'))}",
+                    f"   Break time: {_fmt_time(r.get('htf_event_time'))}",
+                    f"   Order Block: ₹{_fmt_price(r.get('ob_low'))} – ₹{_fmt_price(r.get('ob_high'))}",
+                    f"   OB candle(s): {r.get('ob_candle_count', 'N/A')} | OB time: {_fmt_time(r.get('ob_time'))}",
+                    f"   Fair Value Gap: ₹{_fmt_price(r.get('fvg_low'))} – ₹{_fmt_price(r.get('fvg_high'))}",
+                    f"   FVG time: {_fmt_time(r.get('fvg_time'))} | Displacement: {r.get('displacement_atr', 'N/A')} ATR",
+                    f"   LOWER TIMEFRAME ({'1H' if setup == 'Weekly + 1H' else '4H'})",
+                    f"   Structure: {r.get('ltf_event', 'N/A')} | Break level: ₹{_fmt_price(r.get('ltf_break_level'))}",
+                    f"   Break time: {_fmt_time(r.get('ltf_event_time'))}",
+                    f"   RETRACEMENT / ZONE STATUS",
+                    f"   Retest: {r.get('retest_type', 'N/A')} | Time: {_fmt_time(r.get('retest_time'))}",
+                    f"   FVG mitigated: {_status(r.get('fvg_mitigated'))} | OB mitigated: {_status(r.get('ob_mitigated'))} | OB fully covered: {_status(r.get('ob_fully_covered'))}",
+                ])
+                if r.get("fvg_poi_low") is not None and r.get("fvg_poi_high") is not None:
+                    lines.append(
+                        f"   FVG mitigation candle POI: ₹{_fmt_price(r.get('fvg_poi_low'))} – ₹{_fmt_price(r.get('fvg_poi_high'))} "
+                        f"| Active until OB reached: {_status(r.get('fvg_poi_active'))}"
+                    )
+                if r.get("ob_poi_low") is not None and r.get("ob_poi_high") is not None:
+                    lines.append(
+                        f"   OB mitigation candle POI: ₹{_fmt_price(r.get('ob_poi_low'))} – ₹{_fmt_price(r.get('ob_poi_high'))} "
+                        f"| Active until OB fully covered: {_status(r.get('ob_poi_active'))}"
+                    )
+
+    lines.extend([
+        "",
+        "=" * 64,
+        "STRUCTURE RULE: BOS/CHoCH requires a completed candle close beyond the swing level; wick-only breaks are ignored.",
+        "IMPORTANT: SMC zones are algorithmic approximations. Verify against charts before trading.",
+    ])
+    return "\n".join(lines)
 
 
-def send_email(text):
-    """Send the scan report using Gmail SMTP and a Google App Password."""
+def _format_html(results, scanned, failed):
+    """Build a readable HTML version of the same report; no signal calculations occur here."""
+    now = datetime.now(IST).strftime("%d %b %Y · %H:%M IST")
+    successful = max(0, scanned - failed)
+    parts = [
+        "<html><body style='font-family:Arial,Helvetica,sans-serif;color:#172033;line-height:1.45'>",
+        "<h1 style='margin-bottom:4px'>NIFTY 200 — Daily SMC Scan</h1>",
+        f"<p style='color:#5b6577;margin-top:0'>{html.escape(now)} &nbsp;|&nbsp; Data coverage: <b>{successful}/{scanned}</b> stocks analysed</p>",
+    ]
+    if failed:
+        parts.append(
+            f"<p style='padding:10px;background:#fff3cd;border:1px solid #ffe08a;border-radius:6px'><b>Data warning:</b> {failed} stock(s) could not be analysed. Results may be incomplete.</p>"
+        )
+
+    for setup in REPORT_SETUPS:
+        ltf = "1H" if setup == "Weekly + 1H" else "4H"
+        htf = "Weekly" if setup == "Weekly + 1H" else "Monthly"
+        parts.append(f"<h2 style='border-bottom:2px solid #d8dee9;padding-bottom:6px'>{html.escape(setup)}</h2>")
+        for bias in REPORT_BIASES:
+            matches = sorted(
+                (r for r in results if r.get("setup") == setup and r.get("bias") == bias),
+                key=lambda r: r.get("symbol", ""),
+            )
+            color = "#137333" if bias == "Bullish" else "#b3261e"
+            parts.append(f"<h3 style='color:{color};margin-bottom:8px'>{bias} ({len(matches)})</h3>")
+            if not matches:
+                parts.append("<p><i>No qualifying stocks.</i></p>")
+                continue
+            for r in matches:
+                symbol = html.escape(str(r.get("symbol", "UNKNOWN")))
+                parts.append(
+                    "<div style='border:1px solid #d8dee9;border-radius:8px;padding:14px;margin:10px 0 16px'>"
+                    f"<h3 style='margin:0 0 8px'>{symbol} <span style='font-size:14px;color:#5b6577;font-weight:normal'>Current price: ₹{_fmt_price(r.get('price'))}</span></h3>"
+                    "<table style='border-collapse:collapse;width:100%;font-size:13px'>"
+                )
+                rows = [
+                    ("Higher timeframe", f"{htf} · {r.get('htf_event', 'N/A')} · Break ₹{_fmt_price(r.get('htf_break_level'))} · {_fmt_time(r.get('htf_event_time'))}"),
+                    ("Order Block", f"₹{_fmt_price(r.get('ob_low'))} – ₹{_fmt_price(r.get('ob_high'))} · {r.get('ob_candle_count', 'N/A')} candle(s) · {_fmt_time(r.get('ob_time'))}"),
+                    ("Fair Value Gap", f"₹{_fmt_price(r.get('fvg_low'))} – ₹{_fmt_price(r.get('fvg_high'))} · {_fmt_time(r.get('fvg_time'))} · Displacement {r.get('displacement_atr', 'N/A')} ATR"),
+                    ("Lower timeframe", f"{ltf} · {r.get('ltf_event', 'N/A')} · Break ₹{_fmt_price(r.get('ltf_break_level'))} · {_fmt_time(r.get('ltf_event_time'))}"),
+                    ("Retest", f"{r.get('retest_type', 'N/A')} · {_fmt_time(r.get('retest_time'))}"),
+                    ("Mitigation status", f"FVG: {_status(r.get('fvg_mitigated'))} · OB: {_status(r.get('ob_mitigated'))} · OB fully covered: {_status(r.get('ob_fully_covered'))}"),
+                ]
+                if r.get("fvg_poi_low") is not None and r.get("fvg_poi_high") is not None:
+                    rows.append(("FVG mitigation POI", f"₹{_fmt_price(r.get('fvg_poi_low'))} – ₹{_fmt_price(r.get('fvg_poi_high'))} · Active until OB reached: {_status(r.get('fvg_poi_active'))}"))
+                if r.get("ob_poi_low") is not None and r.get("ob_poi_high") is not None:
+                    rows.append(("OB mitigation POI", f"₹{_fmt_price(r.get('ob_poi_low'))} – ₹{_fmt_price(r.get('ob_poi_high'))} · Active until OB fully covered: {_status(r.get('ob_poi_active'))}"))
+                for label, value in rows:
+                    parts.append(
+                        "<tr>"
+                        f"<td style='padding:7px;border-top:1px solid #e5e9f0;width:160px;color:#5b6577'><b>{html.escape(label)}</b></td>"
+                        f"<td style='padding:7px;border-top:1px solid #e5e9f0'>{html.escape(str(value))}</td>"
+                        "</tr>"
+                    )
+                parts.append("</table></div>")
+
+    parts.extend([
+        "<hr><p style='font-size:12px;color:#5b6577'>BOS/CHoCH requires a completed candle close beyond the swing level; wick-only breaks are ignored. SMC zones are algorithmic approximations; verify charts before trading.</p>",
+        "</body></html>",
+    ])
+    return "".join(parts)
+
+
+def _make_csv_bytes(results):
+    output = io.StringIO(newline="")
+    rows = [_report_row(r) for r in sorted(results, key=lambda x: (x.get("setup", ""), x.get("bias", ""), x.get("symbol", "")))]
+    headers = list(_report_row({}).keys())
+    writer = csv.DictWriter(output, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _make_xlsx_bytes(results, scanned, failed):
+    output = io.BytesIO()
+    rows = [_report_row(r) for r in sorted(results, key=lambda x: (x.get("setup", ""), x.get("bias", ""), x.get("symbol", "")))]
+    columns = list(_report_row({}).keys())
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary = pd.DataFrame([
+            {"Metric": "Report", "Value": "NIFTY 200 Daily Multi-Timeframe SMC Scan"},
+            {"Metric": "Generated (IST)", "Value": datetime.now(IST).strftime("%d %b %Y %H:%M IST")},
+            {"Metric": "Data coverage", "Value": f"{max(0, scanned-failed)}/{scanned}"},
+            {"Metric": "Failed/incomplete stocks", "Value": failed},
+            {"Metric": "Total qualifying signals", "Value": len(results)},
+            {"Metric": "Note", "Value": "Formatting/export only; verify SMC approximations against charts."},
+        ])
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        all_df = pd.DataFrame(rows, columns=columns)
+        all_df.to_excel(writer, sheet_name="All Signals", index=False)
+        for setup, sheet in (("Weekly + 1H", "Weekly + 1H"), ("Monthly + 4H", "Monthly + 4H")):
+            setup_df = all_df[all_df["Setup"] == setup] if not all_df.empty else pd.DataFrame(columns=columns)
+            setup_df.to_excel(writer, sheet_name=sheet, index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for col in ws.columns:
+                max_len = min(max((len(str(cell.value or "")) for cell in col[:100]), default=10) + 2, 42)
+                ws.column_dimensions[col[0].column_letter].width = max(12, max_len)
+    return output.getvalue()
+
+
+def _make_docx_bytes(text, results, scanned, failed):
+    output = io.BytesIO()
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Inches(0.55)
+    section.bottom_margin = Inches(0.55)
+    section.left_margin = Inches(0.65)
+    section.right_margin = Inches(0.65)
+    doc.styles["Normal"].font.name = "Aptos"
+    doc.styles["Normal"].font.size = Pt(9)
+    doc.add_heading("NIFTY 200 — Daily Multi-Timeframe SMC Scan", 0)
+    doc.add_paragraph(f"Generated: {datetime.now(IST).strftime('%d %b %Y · %H:%M IST')}")
+    doc.add_paragraph(f"Data coverage: {max(0, scanned-failed)}/{scanned} stocks analysed · Qualifying signals: {len(results)}")
+    if failed:
+        p = doc.add_paragraph()
+        p.add_run(f"WARNING: {failed} stock(s) could not be analysed; results may be incomplete.").bold = True
+
+    for setup in REPORT_SETUPS:
+        doc.add_heading(setup, level=1)
+        for bias in REPORT_BIASES:
+            matches = sorted(
+                (r for r in results if r.get("setup") == setup and r.get("bias") == bias),
+                key=lambda r: r.get("symbol", ""),
+            )
+            doc.add_heading(f"{bias} ({len(matches)})", level=2)
+            if not matches:
+                doc.add_paragraph("No qualifying stocks.")
+                continue
+            table = doc.add_table(rows=1, cols=5)
+            table.style = "Light Shading Accent 1"
+            hdr = table.rows[0].cells
+            for cell, title in zip(hdr, ("Stock / Price", "HTF structure & zones", "LTF confirmation", "Retest / mitigation", "POI")):
+                cell.text = title
+            for r in matches:
+                cells = table.add_row().cells
+                cells[0].text = f"{r.get('symbol','')}\nPrice: ₹{_fmt_price(r.get('price'))}"
+                cells[1].text = (
+                    f"{r.get('htf_event','N/A')} @ ₹{_fmt_price(r.get('htf_break_level'))}\n"
+                    f"OB: ₹{_fmt_price(r.get('ob_low'))}–₹{_fmt_price(r.get('ob_high'))}\n"
+                    f"FVG: ₹{_fmt_price(r.get('fvg_low'))}–₹{_fmt_price(r.get('fvg_high'))}\n"
+                    f"Displacement: {r.get('displacement_atr','N/A')} ATR"
+                )
+                cells[2].text = f"{r.get('ltf_event','N/A')} @ ₹{_fmt_price(r.get('ltf_break_level'))}\n{_fmt_time(r.get('ltf_event_time'))}"
+                cells[3].text = (
+                    f"{r.get('retest_type','N/A')}\nFVG mitigated: {_status(r.get('fvg_mitigated'))}\n"
+                    f"OB mitigated: {_status(r.get('ob_mitigated'))}\nOB fully covered: {_status(r.get('ob_fully_covered'))}"
+                )
+                poi_lines = []
+                if r.get("fvg_poi_low") is not None and r.get("fvg_poi_high") is not None:
+                    poi_lines.append(f"FVG POI: ₹{_fmt_price(r.get('fvg_poi_low'))}–₹{_fmt_price(r.get('fvg_poi_high'))}")
+                if r.get("ob_poi_low") is not None and r.get("ob_poi_high") is not None:
+                    poi_lines.append(f"OB POI: ₹{_fmt_price(r.get('ob_poi_low'))}–₹{_fmt_price(r.get('ob_poi_high'))}")
+                cells[4].text = "\n".join(poi_lines) if poi_lines else "—"
+    doc.add_paragraph("BOS/CHoCH requires a completed candle close beyond the swing level; wick-only breaks are ignored.")
+    doc.add_paragraph("SMC zones are algorithmic approximations. Verify charts before trading.")
+    doc.save(output)
+    return output.getvalue()
+
+
+def send_email(text, results=None, scanned=0, failed=0):
+    """Send structured HTML/plain-text report plus CSV, XLSX, TXT, and DOCX attachments."""
     username = os.environ.get("EMAIL_USER", "").strip()
     app_password = os.environ.get("EMAIL_APP_PASSWORD", "").replace(" ", "").strip()
     recipient = os.environ.get("EMAIL_TO", "").strip()
     if not all([username, app_password, recipient]):
         raise RuntimeError("Email secrets are missing: EMAIL_USER, EMAIL_APP_PASSWORD, EMAIL_TO.")
 
+    results = results or []
+    now = datetime.now(IST)
+    date_tag = now.strftime("%Y-%m-%d")
     msg = EmailMessage()
     msg["From"] = username
     msg["To"] = recipient
-    msg["Subject"] = f"Nifty 100 Daily Structure Scan — {datetime.now(IST).strftime('%d %b %Y')}"
+    msg["Subject"] = f"Nifty 200 Daily SMC Scan — {now.strftime('%d %b %Y')}"
     msg.set_content(text)
+    msg.add_alternative(_format_html(results, scanned, failed), subtype="html")
+
+    attachments = [
+        (f"nifty200_smc_scan_{date_tag}.txt", text.encode("utf-8"), "text", "plain"),
+        (f"nifty200_smc_scan_{date_tag}.csv", _make_csv_bytes(results), "text", "csv"),
+        (f"nifty200_smc_scan_{date_tag}.xlsx", _make_xlsx_bytes(results, scanned, failed),
+         "application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        (f"nifty200_smc_scan_{date_tag}.docx", _make_docx_bytes(text, results, scanned, failed),
+         "application", "vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ]
+    for filename, payload, maintype, subtype in attachments:
+        msg.add_attachment(payload, maintype=maintype, subtype=subtype, filename=filename)
 
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
         server.ehlo()
@@ -723,7 +977,7 @@ def send_email(text):
         server.ehlo()
         server.login(username, app_password)
         server.send_message(msg)
-    LOG.info("Email report sent to %s", recipient)
+    LOG.info("Email report with CSV/XLSX/TXT/DOCX attachments sent to %s", recipient)
 
 
 def main():
@@ -748,11 +1002,13 @@ def main():
 
     message = format_message(results, len(symbols), failed)
     print(message)
-    # Do not send a misleading empty scan when too much data is missing.
+    # Do not send a misleading normal report or signal attachments when too much data is missing.
     if failed > max(5, int(len(symbols) * 0.10)):
         message = ("NIFTY 200 SCAN FAILED: data unavailable for too many constituents. "
                    f"Coverage {len(symbols)-failed}/{len(symbols)}. Check GitHub Actions logs.")
-    send_email(message)
+        send_email(message, results=[], scanned=len(symbols), failed=failed)
+    else:
+        send_email(message, results=results, scanned=len(symbols), failed=failed)
 
 
 if __name__ == "__main__":
