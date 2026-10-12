@@ -544,7 +544,7 @@ def latest_event(events, max_age=None, length=None):
     return event
 
 
-def analyse_symbol(symbol, daily, hourly):
+def analyse_symbol(symbol, daily, hourly, thirty_minute=None):
     if daily is None or hourly is None or len(daily) < 150 or len(hourly) < 80:
         return [], "insufficient_data"
 
@@ -552,6 +552,8 @@ def analyse_symbol(symbol, daily, hourly):
     hourly = clean_closed_intraday(hourly).dropna(subset=["Open", "High", "Low", "Close"]).copy()
     if len(hourly) < 80:
         return [], "insufficient_intraday"
+    if thirty_minute is not None:
+        thirty_minute = clean_closed_intraday(thirty_minute).dropna(subset=["Open", "High", "Low", "Close"]).copy()
 
     weekly = resample_ohlc(daily, "W-FRI")
     monthly = resample_ohlc(daily, "ME")
@@ -652,10 +654,46 @@ def analyse_symbol(symbol, daily, hourly):
                         **retest,
                     })
 
+    # SETUP C: Daily external break with its own OB + aggressive FVG,
+    # followed by a 30-minute retest into the Daily FVG / FVG-candle POI / Daily OB,
+    # followed by a fresh 30m close-only structure break in the Daily direction.
+    if thirty_minute is not None and len(thirty_minute) >= 80:
+        d_events, _ = structure_events(daily, PIVOT_HTF, PIVOT_HTF)
+        d_event = latest_event(d_events)
+        thirty_events, _ = structure_events(thirty_minute, PIVOT_LTF, PIVOT_LTF)
+        if d_event:
+            daily_zones = detect_ob_fvg(daily, d_event, recent_bars=12)
+            if daily_zones:
+                retest = evaluate_htf_retest(thirty_minute, d_event, daily_zones, d_event["direction"])
+                if retest:
+                    valid_ltf = [
+                        e for e in thirty_events
+                        if e["direction"] == d_event["direction"]
+                        and e["kind"] in ("CHoCH", "BOS")
+                        and e["index"] > retest["retest_index"]
+                        and e["index"] >= len(thirty_minute) - LTF_RECENT_BARS
+                    ]
+                    thirty_event = valid_ltf[-1] if valid_ltf else None
+                    if thirty_event:
+                        candidates.append({
+                            "symbol": symbol,
+                            "setup": "Daily + 30M",
+                            "bias": d_event["direction"],
+                            "htf_event": d_event["kind"],
+                            "ltf_event": thirty_event["kind"],
+                            "htf_break_level": round(float(d_event["level"]), 4),
+                            "ltf_break_level": round(float(thirty_event["level"]), 4),
+                            "price": float(thirty_minute["Close"].iloc[-1]),
+                            "htf_event_time": d_event["time"],
+                            "ltf_event_time": thirty_event["time"],
+                            **daily_zones,
+                            **retest,
+                        })
+
     return candidates, "ok"
 
 
-REPORT_SETUPS = ("Weekly + 1H", "Monthly + 4H")
+REPORT_SETUPS = ("Daily + 30M", "Weekly + 1H", "Monthly + 4H")
 REPORT_BIASES = ("Bullish", "Bearish")
 
 
@@ -748,14 +786,14 @@ def format_message(results, scanned, failed):
                 lines.extend([
                     "",
                     f"{number}. {r.get('symbol', 'UNKNOWN')}  |  Current price: ₹{_fmt_price(r.get('price'))}",
-                    f"   HIGHER TIMEFRAME ({'Weekly' if setup == 'Weekly + 1H' else 'Monthly'})",
+                    f"   HIGHER TIMEFRAME ({'Daily' if setup == 'Daily + 30M' else 'Weekly' if setup == 'Weekly + 1H' else 'Monthly'})",
                     f"   Structure: {r.get('htf_event', 'N/A')} | Break level: ₹{_fmt_price(r.get('htf_break_level'))}",
                     f"   Break time: {_fmt_time(r.get('htf_event_time'))}",
                     f"   Order Block: ₹{_fmt_price(r.get('ob_low'))} – ₹{_fmt_price(r.get('ob_high'))}",
                     f"   OB candle(s): {r.get('ob_candle_count', 'N/A')} | OB time: {_fmt_time(r.get('ob_time'))}",
                     f"   Fair Value Gap: ₹{_fmt_price(r.get('fvg_low'))} – ₹{_fmt_price(r.get('fvg_high'))}",
                     f"   FVG time: {_fmt_time(r.get('fvg_time'))} | Displacement: {r.get('displacement_atr', 'N/A')} ATR",
-                    f"   LOWER TIMEFRAME ({'1H' if setup == 'Weekly + 1H' else '4H'})",
+                    f"   LOWER TIMEFRAME ({'30M' if setup == 'Daily + 30M' else '1H' if setup == 'Weekly + 1H' else '4H'})",
                     f"   Structure: {r.get('ltf_event', 'N/A')} | Break level: ₹{_fmt_price(r.get('ltf_break_level'))}",
                     f"   Break time: {_fmt_time(r.get('ltf_event_time'))}",
                     f"   RETRACEMENT / ZONE STATUS",
@@ -797,8 +835,8 @@ def _format_html(results, scanned, failed):
         )
 
     for setup in REPORT_SETUPS:
-        ltf = "1H" if setup == "Weekly + 1H" else "4H"
-        htf = "Weekly" if setup == "Weekly + 1H" else "Monthly"
+        ltf = "30M" if setup == "Daily + 30M" else "1H" if setup == "Weekly + 1H" else "4H"
+        htf = "Daily" if setup == "Daily + 30M" else "Weekly" if setup == "Weekly + 1H" else "Monthly"
         parts.append(f"<h2 style='border-bottom:2px solid #d8dee9;padding-bottom:6px'>{html.escape(setup)}</h2>")
         for bias in REPORT_BIASES:
             matches = sorted(
@@ -871,7 +909,7 @@ def _make_xlsx_bytes(results, scanned, failed):
         summary.to_excel(writer, sheet_name="Summary", index=False)
         all_df = pd.DataFrame(rows, columns=columns)
         all_df.to_excel(writer, sheet_name="All Signals", index=False)
-        for setup, sheet in (("Weekly + 1H", "Weekly + 1H"), ("Monthly + 4H", "Monthly + 4H")):
+        for setup, sheet in (("Daily + 30M", "Daily + 30M"), ("Weekly + 1H", "Weekly + 1H"), ("Monthly + 4H", "Monthly + 4H")):
             setup_df = all_df[all_df["Setup"] == setup] if not all_df.empty else pd.DataFrame(columns=columns)
             setup_df.to_excel(writer, sheet_name=sheet, index=False)
         for ws in writer.book.worksheets:
@@ -987,11 +1025,15 @@ def main():
     daily_data = download_chunks(symbols, period="5y", interval="1d", chunk_size=10)
     # Yahoo hourly history is limited and unofficial; availability varies by symbol.
     hourly_data = download_chunks(symbols, period="730d", interval="1h", chunk_size=10)
+    # Yahoo Finance generally limits 30-minute intraday history to about 60 days.
+    thirty_minute_data = download_chunks(symbols, period="60d", interval="30m", chunk_size=10)
 
     results, failed = [], 0
     for symbol in symbols:
         try:
-            matches, status = analyse_symbol(symbol, daily_data.get(symbol), hourly_data.get(symbol))
+            matches, status = analyse_symbol(
+                symbol, daily_data.get(symbol), hourly_data.get(symbol), thirty_minute_data.get(symbol)
+            )
             results.extend(matches)
             if status != "ok":
                 failed += 1
@@ -1004,7 +1046,7 @@ def main():
     print(message)
     # Do not send a misleading normal report or signal attachments when too much data is missing.
     if failed > max(5, int(len(symbols) * 0.10)):
-        message = ("NIFTY 200 SCAN FAILED: data unavailable for too many constituents. "
+        message = ("NIFTY 200 SCAN FAILED: data unavailable for too many constituents/timeframes. "
                    f"Coverage {len(symbols)-failed}/{len(symbols)}. Check GitHub Actions logs.")
         send_email(message, results=[], scanned=len(symbols), failed=failed)
     else:
