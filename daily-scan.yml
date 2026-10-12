@@ -1,0 +1,37 @@
+name: Nifty 100 daily scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 16:17 IST = 10:47 UTC, Monday-Friday; off the hour to reduce queue delays.
+    - cron: "47 10 * * 1-5"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner and send WhatsApp report
+        env:
+          WA_TOKEN: ${{ secrets.WA_TOKEN }}
+          WA_PHONE_NUMBER_ID: ${{ secrets.WA_PHONE_NUMBER_ID }}
+          WA_TO: ${{ secrets.WA_TO }}
+          WA_TEMPLATE_NAME: ${{ secrets.WA_TEMPLATE_NAME }}
+          WA_TEMPLATE_LANGUAGE: ${{ secrets.WA_TEMPLATE_LANGUAGE }}
+          WA_GRAPH_API_VERSION: ${{ secrets.WA_GRAPH_API_VERSION }}
+        run: python scanner.py
