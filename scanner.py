@@ -12,8 +12,8 @@ import requests
 import yfinance as yf
 
 IST = ZoneInfo("Asia/Kolkata")
-NIFTY100_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv"
-LOG = logging.getLogger("nifty100_scanner")
+NIFTY200_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
+LOG = logging.getLogger("nifty200_scanner")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # Explicit, repeatable starting rules. Tune only after chart-by-chart validation.
@@ -25,21 +25,30 @@ LTF_RECENT_BARS = 12
 
 
 def fetch_symbols():
+    """Fetch the current Nifty 200 constituents from the official index CSV."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Nifty100Scanner/1.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; Nifty200Scanner/2.0)",
         "Accept": "text/csv,*/*",
         "Referer": "https://www.niftyindices.com/",
     }
-    response = requests.get(NIFTY100_CSV_URL, headers=headers, timeout=25)
+    response = requests.get(NIFTY200_CSV_URL, headers=headers, timeout=25)
     response.raise_for_status()
     from io import StringIO
     constituents = pd.read_csv(StringIO(response.text))
     symbol_col = next((c for c in constituents.columns if c.strip().lower() == "symbol"), None)
     if not symbol_col:
-        raise RuntimeError(f"Could not find Symbol column in official constituent CSV: {list(constituents.columns)}")
-    symbols = sorted({str(s).strip().upper() for s in constituents[symbol_col].dropna() if str(s).strip()})
-    if len(symbols) < 90:
-        raise RuntimeError(f"Expected around 100 Nifty 100 constituents; received only {len(symbols)}.")
+        raise RuntimeError(
+            f"Could not find Symbol column in official Nifty 200 CSV: {list(constituents.columns)}"
+        )
+    symbols = sorted({
+        str(symbol).strip().upper()
+        for symbol in constituents[symbol_col].dropna()
+        if str(symbol).strip()
+    })
+    if len(symbols) < 180:
+        raise RuntimeError(
+            f"Expected around 200 Nifty 200 constituents; received only {len(symbols)}."
+        )
     return symbols
 
 
@@ -229,6 +238,9 @@ def structure_events(df, left, right):
 
         if direction:
             prior_trend = trend_before(i)
+            # Do not guess CHoCH when the prior external trend is ambiguous.
+            if prior_trend is None:
+                continue
             kind = "BOS" if prior_trend == direction else "CHoCH"
             events.append({
                 "index": i,
@@ -319,33 +331,203 @@ def detect_ob_fvg(df, event, recent_bars=LTF_RECENT_BARS):
             displacement_ok = float(c2["Close"]) < float(c2["Open"])
         if not (fvg_ok and displacement_ok):
             continue
-        # OB is the last opposite-colour candle before the displacement candle.
+        # Find the nearest opposite-colour candle before displacement, then
+        # aggregate its contiguous opposite-colour run (maximum three candles).
         ob_idx = None
-        for j in range(i-2, max(-1, i-8), -1):
+        for j in range(i - 2, max(-1, i - 8), -1):
             candle = df.iloc[j]
-            if direction == "Bullish" and float(candle["Close"]) < float(candle["Open"]):
-                ob_idx = j
-                break
-            if direction == "Bearish" and float(candle["Close"]) > float(candle["Open"]):
+            is_opposite = (
+                float(candle["Close"]) < float(candle["Open"])
+                if direction == "Bullish"
+                else float(candle["Close"]) > float(candle["Open"])
+            )
+            if is_opposite:
                 ob_idx = j
                 break
         if ob_idx is None:
             continue
-        ob = df.iloc[ob_idx]
+
+        ob_indices = [ob_idx]
+        for j in range(ob_idx - 1, max(-1, ob_idx - 3), -1):
+            candle = df.iloc[j]
+            is_opposite = (
+                float(candle["Close"]) < float(candle["Open"])
+                if direction == "Bullish"
+                else float(candle["Close"]) > float(candle["Open"])
+            )
+            if not is_opposite or len(ob_indices) >= 3:
+                break
+            ob_indices.append(j)
+
+        ob_group = df.iloc[sorted(ob_indices)]
         fvg_low = float(c1["High"]) if direction == "Bullish" else float(c3["High"])
         fvg_high = float(c3["Low"]) if direction == "Bullish" else float(c1["Low"])
         # Require the FVG to be temporally close to the structural break.
         if abs(i - end_i) > 3:
             continue
         return {
-            "ob_low": min(float(ob["Open"]), float(ob["Close"]), float(ob["Low"])),
-            "ob_high": max(float(ob["Open"]), float(ob["Close"]), float(ob["High"])),
+            "ob_low": float(ob_group["Low"].min()),
+            "ob_high": float(ob_group["High"].max()),
+            "ob_time": df.index[min(ob_indices)].isoformat(),
+            "ob_candle_count": len(ob_indices),
             "fvg_low": min(fvg_low, fvg_high),
             "fvg_high": max(fvg_low, fvg_high),
             "fvg_time": df.index[i].isoformat(),
+            "fvg_candle_low": float(c3["Low"]),
+            "fvg_candle_high": float(c3["High"]),
+            "fvg_index": int(i),
+            "ob_index": int(ob_idx),
             "displacement_atr": round(body / av, 2),
         }
     return None
+
+
+def candle_touches_zone(candle, zone_low, zone_high):
+    """A wick/range touch is valid for zone mitigation; it is NOT a BOS/CHoCH."""
+    return float(candle["High"]) >= float(zone_low) and float(candle["Low"]) <= float(zone_high)
+
+
+def evaluate_htf_retest(ltf, htf_event, zones, direction):
+    """
+    Replay lower-timeframe candles after the higher-timeframe break.
+
+    State rules:
+    1. Price must return to the HTF FVG, its defining candle range, or the HTF OB.
+    2. The first FVG touch marks that FVG as mitigated/eliminated. The touch candle's
+       directional extreme becomes the next POI (high for bearish, low for bullish).
+    3. That POI remains tracked until price reaches the HTF OB.
+    4. OB overlap marks mitigation; complete coverage is tracked separately.
+    5. A lower-timeframe BOS/CHoCH must occur AFTER the qualifying retest.
+    Candle ranges may mitigate zones; only candle CLOSES may break structure.
+    """
+    if ltf is None or ltf.empty or not zones or not htf_event:
+        return None
+
+    htf_time = pd.Timestamp(htf_event["time"])
+    if htf_time.tzinfo is None:
+        htf_time = htf_time.tz_localize("Asia/Kolkata")
+    else:
+        htf_time = htf_time.tz_convert("Asia/Kolkata")
+
+    # Weekly/monthly resampled bars are labelled at local midnight. Their close
+    # is not confirmed until the NSE session ends on that label date.
+    htf_time = htf_time.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    frame = ltf.copy()
+    if frame.index.tz is None:
+        frame.index = frame.index.tz_localize("Asia/Kolkata")
+    else:
+        frame.index = frame.index.tz_convert("Asia/Kolkata")
+    original_positions = {timestamp: position for position, timestamp in enumerate(frame.index)}
+    frame = frame.loc[frame.index > htf_time]
+    if frame.empty:
+        return None
+
+    fvg_low, fvg_high = float(zones["fvg_low"]), float(zones["fvg_high"])
+    ob_low, ob_high = float(zones["ob_low"]), float(zones["ob_high"])
+    # Include the full three-candle FVG formation candle range as a POI.
+    fvg_candle_low = float(zones.get("fvg_candle_low", fvg_low))
+    fvg_candle_high = float(zones.get("fvg_candle_high", fvg_high))
+
+    fvg_mitigated = False
+    fvg_mitigation_time = None
+    fvg_poi_level = None
+    fvg_poi_high = None
+    fvg_poi_low = None
+    fvg_poi_active = False
+    ob_mitigated = False
+    ob_fully_covered = False
+    ob_mitigation_time = None
+    ob_poi_level = None
+    ob_poi_high = None
+    ob_poi_low = None
+    ob_poi_active = False
+    first_retest_index = None
+    first_retest_timestamp = None
+    retest_type = None
+
+    for timestamp, candle in frame.iterrows():
+        source_idx = original_positions[timestamp]
+        touches_fvg = candle_touches_zone(candle, fvg_low, fvg_high)
+        touches_fvg_candle = candle_touches_zone(candle, fvg_candle_low, fvg_candle_high)
+        touches_ob = candle_touches_zone(candle, ob_low, ob_high)
+
+        if not fvg_mitigated and (touches_fvg or touches_fvg_candle):
+            fvg_mitigated = True
+            fvg_mitigation_time = timestamp.isoformat()
+            fvg_poi_high = float(candle["High"])
+            fvg_poi_low = float(candle["Low"])
+            fvg_poi_level = fvg_poi_high if direction == "Bearish" else fvg_poi_low
+            fvg_poi_active = True
+            first_retest_index = source_idx
+            first_retest_timestamp = timestamp
+            retest_type = "HTF FVG retest"
+
+        # After FVG mitigation, retain the mitigation candle's swing extreme as POI
+        # until price reaches the HTF OB zone.
+        if fvg_mitigated and not touches_ob and fvg_poi_level is not None:
+            if direction == "Bearish":
+                poi_reached = float(candle["High"]) >= fvg_poi_level
+            else:
+                poi_reached = float(candle["Low"]) <= fvg_poi_level
+            if poi_reached and first_retest_index is None:
+                first_retest_index = source_idx
+                first_retest_timestamp = timestamp
+                retest_type = "FVG mitigation-candle swing POI"
+
+        if touches_ob:
+            # Reaching the OB ends the FVG-mitigation-candle POI phase.
+            fvg_poi_active = False
+            if not ob_mitigated:
+                ob_mitigated = True
+                ob_mitigation_time = timestamp.isoformat()
+                ob_poi_high = float(candle["High"])
+                ob_poi_low = float(candle["Low"])
+                ob_poi_level = ob_poi_high if direction == "Bearish" else ob_poi_low
+                ob_poi_active = True
+                if first_retest_index is None:
+                    first_retest_index = source_idx
+                    first_retest_timestamp = timestamp
+                    retest_type = "HTF OB retest"
+
+            # A bearish OB is fully covered when price reaches its far/top boundary;
+            # a bullish OB is fully covered when price reaches its far/bottom boundary.
+            if direction == "Bearish" and float(candle["High"]) >= ob_high:
+                ob_fully_covered = True
+                ob_poi_active = False
+            elif direction == "Bullish" and float(candle["Low"]) <= ob_low:
+                ob_fully_covered = True
+                ob_poi_active = False
+
+        # Once OB has been touched, its mitigation candle extreme is tracked as POI
+        # until full coverage is observed. This is diagnostic state, not a break signal.
+        if ob_mitigated and not ob_fully_covered and ob_poi_level is not None:
+            if direction == "Bearish":
+                _ob_poi_reached = float(candle["High"]) >= ob_poi_level
+            else:
+                _ob_poi_reached = float(candle["Low"]) <= ob_poi_level
+
+    if first_retest_index is None:
+        return None
+
+    return {
+        "retest_index": int(first_retest_index),
+        "retest_time": first_retest_timestamp.isoformat(),
+        "retest_type": retest_type or "HTF zone retest",
+        "fvg_mitigated": fvg_mitigated,
+        "fvg_mitigation_time": fvg_mitigation_time or "not yet mitigated",
+        "fvg_mitigation_poi": fvg_poi_level,
+        "fvg_poi_high": fvg_poi_high,
+        "fvg_poi_low": fvg_poi_low,
+        "fvg_poi_active": fvg_poi_active,
+        "ob_mitigated": ob_mitigated,
+        "ob_mitigation_time": ob_mitigation_time or "not yet mitigated",
+        "ob_mitigation_poi": ob_poi_level,
+        "ob_poi_high": ob_poi_high,
+        "ob_poi_low": ob_poi_low,
+        "ob_poi_active": ob_poi_active,
+        "ob_fully_covered": ob_fully_covered,
+    }
 
 
 def latest_event(events, max_age=None, length=None):
@@ -360,6 +542,7 @@ def latest_event(events, max_age=None, length=None):
 def analyse_symbol(symbol, daily, hourly):
     if daily is None or hourly is None or len(daily) < 150 or len(hourly) < 80:
         return [], "insufficient_data"
+
     daily = daily.dropna(subset=["Open", "High", "Low", "Close"]).copy()
     hourly = clean_closed_intraday(hourly).dropna(subset=["Open", "High", "Low", "Close"]).copy()
     if len(hourly) < 80:
@@ -369,8 +552,7 @@ def analyse_symbol(symbol, daily, hourly):
     monthly = resample_ohlc(daily, "ME")
     four_hour = resample_4h_nse(hourly)
 
-    # Use only fully closed weekly/monthly candles for higher-timeframe bias.
-    # On a Friday after close, include the current week only if Friday data exists.
+    # Exclude incomplete weekly/monthly candles.
     now = datetime.now(IST)
     daily_dates = [ts.date() for ts in daily.index.tz_convert("Asia/Kolkata")]
     latest_daily_date = max(daily_dates) if daily_dates else None
@@ -381,8 +563,6 @@ def analyse_symbol(symbol, daily, hourly):
         week_cutoff = this_friday - timedelta(days=7)
     weekly = weekly[[ts.date() <= week_cutoff for ts in weekly.index]]
 
-    # The month is considered complete on its last weekday only when that day's
-    # daily candle is available and the market close has passed.
     first_next_month = (now.date().replace(day=28) + timedelta(days=4)).replace(day=1)
     calendar_month_end = first_next_month - timedelta(days=1)
     last_weekday = calendar_month_end
@@ -392,57 +572,135 @@ def analyse_symbol(symbol, daily, hourly):
             and latest_daily_date == now.date()):
         month_cutoff = calendar_month_end
     else:
-        previous_month_end = now.date().replace(day=1) - timedelta(days=1)
-        month_cutoff = previous_month_end
+        month_cutoff = now.date().replace(day=1) - timedelta(days=1)
     monthly = monthly[[ts.date() <= month_cutoff for ts in monthly.index]]
 
     candidates = []
-    # Setup A: Weekly bias + 1h alignment.
+
+    # SETUP A: A valid Weekly external break with its own OB + aggressive FVG,
+    # followed by an LTF retracement into the Weekly FVG/its candle POI/Weekly OB,
+    # followed by a fresh 1H close-only structure break in the Weekly direction.
     w_events, _ = structure_events(weekly, PIVOT_HTF, PIVOT_HTF)
-    w_event = latest_event(w_events)
     h_events, _ = structure_events(hourly, PIVOT_LTF, PIVOT_LTF)
-    h_event = latest_event(h_events, max_age=LTF_RECENT_BARS, length=len(hourly))
-    if w_event and h_event and w_event["direction"] == h_event["direction"]:
-        obfvg = detect_ob_fvg(hourly, h_event)
-        if obfvg:
-            candidates.append({
-                "symbol": symbol, "setup": "Weekly + 1H",
-                "bias": w_event["direction"], "htf_event": w_event["kind"],
-                "ltf_event": h_event["kind"], "price": float(hourly["Close"].iloc[-1]),
-                **obfvg
-            })
+    w_event = latest_event(w_events)
+    if w_event:
+        weekly_zones = detect_ob_fvg(weekly, w_event, recent_bars=12)
+        if weekly_zones:
+            retest = evaluate_htf_retest(hourly, w_event, weekly_zones, w_event["direction"])
+            if retest:
+                valid_ltf = [
+                    e for e in h_events
+                    if e["direction"] == w_event["direction"]
+                    and e["kind"] in ("CHoCH", "BOS")
+                    and e["index"] > retest["retest_index"]
+                    and e["index"] >= len(hourly) - LTF_RECENT_BARS
+                ]
+                h_event = valid_ltf[-1] if valid_ltf else None
+                if h_event:
+                    candidates.append({
+                        "symbol": symbol,
+                        "setup": "Weekly + 1H",
+                        "bias": w_event["direction"],
+                        "htf_event": w_event["kind"],
+                        "ltf_event": h_event["kind"],
+                        "htf_break_level": round(float(w_event["level"]), 4),
+                        "ltf_break_level": round(float(h_event["level"]), 4),
+                        "price": float(hourly["Close"].iloc[-1]),
+                        "htf_event_time": w_event["time"],
+                        "ltf_event_time": h_event["time"],
+                        **weekly_zones,
+                        **retest,
+                    })
 
-    # Setup B: Monthly bias + 4h alignment.
+    # SETUP B: A valid Monthly external break with its own OB + aggressive FVG,
+    # followed by an LTF retracement into the Monthly FVG/its candle POI/Monthly OB,
+    # followed by a fresh 4H close-only structure break in the Monthly direction.
     m_events, _ = structure_events(monthly, PIVOT_HTF, PIVOT_HTF)
-    m_event = latest_event(m_events)
     f_events, _ = structure_events(four_hour, PIVOT_LTF, PIVOT_LTF)
-    f_event = latest_event(f_events, max_age=6, length=len(four_hour))
-    if m_event and f_event and m_event["direction"] == f_event["direction"]:
-        obfvg = detect_ob_fvg(four_hour, f_event, recent_bars=6)
-        if obfvg:
-            candidates.append({
-                "symbol": symbol, "setup": "Monthly + 4H",
-                "bias": m_event["direction"], "htf_event": m_event["kind"],
-                "ltf_event": f_event["kind"], "price": float(hourly["Close"].iloc[-1]),
-                **obfvg
-            })
-    return candidates, "ok"
+    m_event = latest_event(m_events)
+    if m_event:
+        monthly_zones = detect_ob_fvg(monthly, m_event, recent_bars=12)
+        if monthly_zones:
+            retest = evaluate_htf_retest(four_hour, m_event, monthly_zones, m_event["direction"])
+            if retest:
+                valid_ltf = [
+                    e for e in f_events
+                    if e["direction"] == m_event["direction"]
+                    and e["kind"] in ("CHoCH", "BOS")
+                    and e["index"] > retest["retest_index"]
+                    and e["index"] >= len(four_hour) - 6
+                ]
+                f_event = valid_ltf[-1] if valid_ltf else None
+                if f_event:
+                    candidates.append({
+                        "symbol": symbol,
+                        "setup": "Monthly + 4H",
+                        "bias": m_event["direction"],
+                        "htf_event": m_event["kind"],
+                        "ltf_event": f_event["kind"],
+                        "htf_break_level": round(float(m_event["level"]), 4),
+                        "ltf_break_level": round(float(f_event["level"]), 4),
+                        "price": float(hourly["Close"].iloc[-1]),
+                        "htf_event_time": m_event["time"],
+                        "ltf_event_time": f_event["time"],
+                        **monthly_zones,
+                        **retest,
+                    })
 
+    return candidates, "ok"
 
 def format_message(results, scanned, failed):
     now = datetime.now(IST).strftime("%d-%b-%Y %H:%M IST")
-    lines = [f"NIFTY 100 STRUCTURE SCAN | {now}", ""]
+    lines = [f"NIFTY 200 MULTI-TIMEFRAME SMC SCAN | {now}", ""]
     for setup in ("Weekly + 1H", "Monthly + 4H"):
         lines.append(setup)
         for bias in ("Bullish", "Bearish"):
-            matches = sorted(r["symbol"] for r in results if r["setup"] == setup and r["bias"] == bias)
-            lines.append(f"{bias}: {', '.join(matches) if matches else 'None'}")
+            matches = [r for r in results if r["setup"] == setup and r["bias"] == bias]
+            matches.sort(key=lambda r: r["symbol"])
+            lines.append(f"{bias}:")
+            if not matches:
+                lines.append("  None")
+            for r in matches:
+                lines.append(
+                    f"  {r['symbol']} | HTF {r['htf_event']} @ {r['htf_break_level']} "
+                    f"| LTF {r['ltf_event']} @ {r['ltf_break_level']} "
+                    f"| Price {r['price']:.2f}"
+                )
+                lines.append(
+                    f"    HTF OB [{r['ob_low']:.2f}, {r['ob_high']:.2f}] "
+                    f"({r.get('ob_time', 'time unavailable')}; "
+                    f"{r.get('ob_candle_count', 1)} candle(s))"
+                )
+                lines.append(
+                    f"    HTF FVG [{r['fvg_low']:.2f}, {r['fvg_high']:.2f}] "
+                    f"({r.get('fvg_time', 'time unavailable')}); "
+                    f"displacement {r['displacement_atr']:.2f} ATR"
+                )
+                lines.append(
+                    f"    Retest: {r['retest_type']} at {r['retest_time']}; "
+                    f"FVG mitigated={r['fvg_mitigated']}; "
+                    f"OB mitigated={r['ob_mitigated']}; "
+                    f"OB fully covered={r['ob_fully_covered']}"
+                )
+                if r.get("fvg_poi_high") is not None and r.get("fvg_poi_low") is not None:
+                    lines.append(
+                        f"    FVG-mitigation candle range/POI: "
+                        f"[{r['fvg_poi_low']:.2f}, {r['fvg_poi_high']:.2f}] "
+                        f"(active until OB reached: {r['fvg_poi_active']})"
+                    )
+                if r.get("ob_poi_high") is not None and r.get("ob_poi_low") is not None:
+                    lines.append(
+                        f"    OB-mitigation candle range/POI: "
+                        f"[{r['ob_poi_low']:.2f}, {r['ob_poi_high']:.2f}] "
+                        f"(active until OB fully covered: {r['ob_poi_active']})"
+                    )
         lines.append("")
     lines.append(f"Data coverage: {scanned - failed}/{scanned} stocks")
     if failed:
-        lines.append("WARNING: incomplete data; results are provisional.")
-    lines.append("Signals use closed candles; verify charts before trading.")
-    return "\n".join(lines)
+        lines.append("WARNING: incomplete data; results may be provisional.")
+    lines.append("Structure breaks require completed candle closes; wick-only breaks are ignored.")
+    lines.append("SMC zones are algorithmic approximations; verify charts before trading.")
+    return "\\n".join(lines)
 
 
 def send_email(text):
@@ -470,10 +728,10 @@ def send_email(text):
 
 def main():
     symbols = fetch_symbols()
-    LOG.info("Loaded %d Nifty 100 constituents", len(symbols))
+    LOG.info("Loaded %d Nifty 200 constituents", len(symbols))
     # Daily bars provide enough history to construct weekly/monthly structure.
     daily_data = download_chunks(symbols, period="5y", interval="1d", chunk_size=10)
-    # Yahoo hourly history is limited and unofficial; 730d is requested, but availability may vary.
+    # Yahoo hourly history is limited and unofficial; availability varies by symbol.
     hourly_data = download_chunks(symbols, period="730d", interval="1h", chunk_size=10)
 
     results, failed = [], 0
@@ -492,7 +750,7 @@ def main():
     print(message)
     # Do not send a misleading empty scan when too much data is missing.
     if failed > max(5, int(len(symbols) * 0.10)):
-        message = ("NIFTY 100 SCAN FAILED: data unavailable for too many constituents. "
+        message = ("NIFTY 200 SCAN FAILED: data unavailable for too many constituents. "
                    f"Coverage {len(symbols)-failed}/{len(symbols)}. Check GitHub Actions logs.")
     send_email(message)
 
@@ -504,7 +762,7 @@ if __name__ == "__main__":
         LOG.exception("Scanner failed")
         # Best effort failure notification, if messaging credentials are configured.
         try:
-            send_email("NIFTY 100 SCAN FAILED. Please check the GitHub Actions run logs.")
+            send_email("NIFTY 200 SCAN FAILED. Please check the GitHub Actions run logs.")
         except Exception:
             LOG.exception("Could not send failure alert")
         sys.exit(1)
