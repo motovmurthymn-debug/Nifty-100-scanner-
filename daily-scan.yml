@@ -26,12 +26,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scanner and send WhatsApp report
+      - name: Run scanner and email report
         env:
-          WA_TOKEN: ${{ secrets.WA_TOKEN }}
-          WA_PHONE_NUMBER_ID: ${{ secrets.WA_PHONE_NUMBER_ID }}
-          WA_TO: ${{ secrets.WA_TO }}
-          WA_TEMPLATE_NAME: ${{ secrets.WA_TEMPLATE_NAME }}
-          WA_TEMPLATE_LANGUAGE: ${{ secrets.WA_TEMPLATE_LANGUAGE }}
-          WA_GRAPH_API_VERSION: ${{ secrets.WA_GRAPH_API_VERSION }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python scanner.py

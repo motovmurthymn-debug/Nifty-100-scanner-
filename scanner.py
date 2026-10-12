@@ -2,6 +2,8 @@ import os
 import sys
 import time
 import logging
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -395,48 +397,27 @@ def format_message(results, scanned, failed):
     return "\n".join(lines)
 
 
-def send_whatsapp(text):
-    token = os.environ.get("WA_TOKEN", "").strip()
-    phone_id = os.environ.get("WA_PHONE_NUMBER_ID", "").strip()
-    recipient = os.environ.get("WA_TO", "").strip()
-    template = os.environ.get("WA_TEMPLATE_NAME", "nifty100_daily_scan").strip()
-    language = os.environ.get("WA_TEMPLATE_LANGUAGE", "en_US").strip()
-    version = os.environ.get("WA_GRAPH_API_VERSION", "v23.0").strip()
-    if not all([token, phone_id, recipient]):
-        raise RuntimeError("WhatsApp secrets are missing: WA_TOKEN, WA_PHONE_NUMBER_ID, WA_TO.")
-    # Proactive daily delivery requires a Meta-approved template outside the 24-hour service window.
-    # Split long output into chunks conservatively for template variable limits.
-    chunks = []
-    current = ""
-    for line in text.splitlines():
-        candidate = (current + "\n" + line).strip() if current else line
-        if len(candidate) > 850 and current:
-            chunks.append(current)
-            current = line
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    url = f"https://graph.facebook.com/{version}/{phone_id}/messages"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    for chunk in chunks:
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": recipient,
-            "type": "template",
-            "template": {
-                "name": template,
-                "language": {"code": language},
-                "components": [{
-                    "type": "body",
-                    "parameters": [{"type": "text", "text": chunk}]
-                }]
-            }
-        }
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        if response.status_code >= 300:
-            raise RuntimeError(f"WhatsApp API error {response.status_code}: {response.text[:1200]}")
-        LOG.info("WhatsApp message accepted: %s", response.json().get("messages", [{}])[0].get("id", "no-id"))
+def send_email(text):
+    """Send the scan report using Gmail SMTP and a Google App Password."""
+    username = os.environ.get("EMAIL_USER", "").strip()
+    app_password = os.environ.get("EMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+    recipient = os.environ.get("EMAIL_TO", "").strip()
+    if not all([username, app_password, recipient]):
+        raise RuntimeError("Email secrets are missing: EMAIL_USER, EMAIL_APP_PASSWORD, EMAIL_TO.")
+
+    msg = EmailMessage()
+    msg["From"] = username
+    msg["To"] = recipient
+    msg["Subject"] = f"Nifty 100 Daily Structure Scan — {datetime.now(IST).strftime('%d %b %Y')}"
+    msg.set_content(text)
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(username, app_password)
+        server.send_message(msg)
+    LOG.info("Email report sent to %s", recipient)
 
 
 def main():
@@ -465,7 +446,7 @@ def main():
     if failed > max(5, int(len(symbols) * 0.10)):
         message = ("NIFTY 100 SCAN FAILED: data unavailable for too many constituents. "
                    f"Coverage {len(symbols)-failed}/{len(symbols)}. Check GitHub Actions logs.")
-    send_whatsapp(message)
+    send_email(message)
 
 
 if __name__ == "__main__":
@@ -475,7 +456,7 @@ if __name__ == "__main__":
         LOG.exception("Scanner failed")
         # Best effort failure notification, if messaging credentials are configured.
         try:
-            send_whatsapp("NIFTY 100 SCAN FAILED. Please check the GitHub Actions run logs.")
+            send_email("NIFTY 100 SCAN FAILED. Please check the GitHub Actions run logs.")
         except Exception:
             LOG.exception("Could not send failure alert")
         sys.exit(1)
