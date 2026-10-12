@@ -163,37 +163,85 @@ def pivots(df, left, right, min_swing_atr=MIN_SWING_ATR):
 
 
 def structure_events(df, left, right):
-    """Find candle-close breaks of confirmed external pivots; wick-only breaches do not count."""
+    """
+    Detect breaks of the latest confirmed external swing high/low.
+
+    IMPORTANT:
+    - A break is valid ONLY when a candle CLOSES beyond the swing level.
+    - High/Low wick breaches never count as BOS or CHoCH.
+    - Swings are the alternating, ATR-filtered pivots returned by pivots().
+    - The broken level must already have been confirmed before the break candle.
+    - CHoCH is used when the break opposes the recent external swing trend;
+      BOS is used when it continues that trend. If the trend is not clear,
+      classify the first valid break as CHoCH rather than guessing.
+    """
     if df is None or len(df) < max(35, left + right + 20):
         return [], []
+
     ps = pivots(df, left, right)
     highs = [p for p in ps if p[1] == "H"]
     lows = [p for p in ps if p[1] == "L"]
-    events = []
-    previous_direction = None
     close = df["Close"].to_numpy()
+    events = []
+
+    def trend_before(bar_index):
+        # Only pivots confirmed before the candidate break candle may be used.
+        known = [p for p in ps if p[3] < bar_index]
+        known_highs = [p for p in known if p[1] == "H"]
+        known_lows = [p for p in known if p[1] == "L"]
+        if len(known_highs) < 2 or len(known_lows) < 2:
+            return None
+
+        previous_high, latest_high = known_highs[-2], known_highs[-1]
+        previous_low, latest_low = known_lows[-2], known_lows[-1]
+
+        higher_highs = latest_high[2] > previous_high[2]
+        higher_lows = latest_low[2] > previous_low[2]
+        lower_highs = latest_high[2] < previous_high[2]
+        lower_lows = latest_low[2] < previous_low[2]
+
+        if higher_highs and higher_lows:
+            return "Bullish"
+        if lower_highs and lower_lows:
+            return "Bearish"
+        return None
+
     for i in range(1, len(df)):
+        # Use only external pivots whose right-side confirmation bars have closed.
         known_highs = [p for p in highs if p[3] < i]
         known_lows = [p for p in lows if p[3] < i]
         if not known_highs and not known_lows:
             continue
+
         last_high = known_highs[-1] if known_highs else None
         last_low = known_lows[-1] if known_lows else None
+
         direction = None
         level = None
         pivot = None
-        if last_high and close[i] > last_high[2] and close[i-1] <= last_high[2]:
+
+        # CLOSE-only crossing checks. Candle High/Low are deliberately not used
+        # to trigger a structure break, so wick-only sweeps are ignored.
+        if last_high and close[i - 1] <= last_high[2] and close[i] > last_high[2]:
             direction, level, pivot = "Bullish", last_high[2], last_high
-        elif last_low and close[i] < last_low[2] and close[i-1] >= last_low[2]:
+        elif last_low and close[i - 1] >= last_low[2] and close[i] < last_low[2]:
             direction, level, pivot = "Bearish", last_low[2], last_low
+
         if direction:
-            kind = "BOS" if previous_direction == direction else "CHoCH"
+            prior_trend = trend_before(i)
+            kind = "BOS" if prior_trend == direction else "CHoCH"
             events.append({
-                "index": i, "direction": direction, "kind": kind,
-                "level": float(level), "pivot_index": int(pivot[0]),
-                "time": df.index[i].isoformat()
+                "index": i,
+                "direction": direction,
+                "kind": kind,
+                "level": float(level),
+                "pivot_index": int(pivot[0]),
+                "pivot_confirmed_index": int(pivot[3]),
+                "time": df.index[i].isoformat(),
+                "prior_trend": prior_trend,
             })
-            previous_direction = direction
+
+    # The scanner uses the latest event; retain the full event list for diagnostics.
     return events, ps
 
 
