@@ -1,18 +1,23 @@
-name: Nifty 100 daily scan
+name: Nifty 200 daily scan
 
 on:
   workflow_dispatch:
   schedule:
-    # 16:17 IST = 10:47 UTC, Monday-Friday; off the hour to reduce queue delays.
-    - cron: "47 10 * * 1-5"
+    # 16:20 IST = 10:50 UTC, Monday-Friday (NSE trading weekdays).
+    # GitHub Actions schedules are best-effort and may start late.
+    - cron: "50 10 * * 1-5"
 
 permissions:
   contents: read
 
+concurrency:
+  group: nifty200-daily-scan
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
